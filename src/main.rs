@@ -35,6 +35,8 @@ enum Command {
     Languages,
     #[command(description = "list all supported compilers, specific language id can be specified.")]
     Compilers { language: String },
+    #[command(description = "compile and execute the code from the message.", aliases = ["e"])]
+    Execute,
 }
 
 fn format_languages(langs: &[godbolt::Language]) -> String {
@@ -80,9 +82,14 @@ fn format_languages(langs: &[godbolt::Language]) -> String {
     return wrap_in_md(&message);
 }
 
-fn wrap_in_md(s: &str) -> String {
+fn wrap_in_named_md(s: &str, name: &str) -> String {
     let safe_s = markdown::escape(s);
-    format!("```\n{safe_s}\n```")
+    let safe_name = markdown::escape(name);
+    format!("```{safe_name}\n{safe_s}\n```")
+}
+
+fn wrap_in_md(s: &str) -> String {
+    wrap_in_named_md(s, "")
 }
 
 fn trim_message(s: &str) -> Cow<str> {
@@ -277,6 +284,43 @@ async fn answer(bot: Bot, msg: Message, cmd: Command) -> ResponseResult<()> {
                 .collect::<Vec<&godbolt::Compiler>>();
             let message = format_compilers(&filtered_compilers);
             send_md(&bot, msg.chat.id, &message).await?;
+        }
+        Command::Execute => {
+            let parse_result = parse_compile_msg(&msg);
+            match parse_result {
+                Ok((id, code)) => {
+                    let res = godbolt::execute(&id, &code, "").await?;
+                    match res {
+                        godbolt::ExecutionOutput::ExecutionSuccess {
+                            stdout,
+                            stderr,
+                            exit_code,
+                        } => {
+                            log::info!(
+                                "stdout: {stdout}, stderr: {stderr}, exit_code: {exit_code}"
+                            );
+                            let md_stdout = wrap_in_named_md(&stdout, "stdout");
+                            let md_stderr = wrap_in_named_md(&stderr, "stderr");
+                            let md_exit_code =
+                                wrap_in_named_md(&exit_code.to_string(), "exit_code");
+                            let res = format!("{md_stdout}\n{md_stderr}\n{md_exit_code}");
+                            send_md(&bot, msg.chat.id, &res).await?;
+                        }
+                        godbolt::ExecutionOutput::ApiError(error) => {
+                            log::info!("Error: {error}");
+                            send_md(&bot, msg.chat.id, &error).await?;
+                        }
+                        godbolt::ExecutionOutput::BuildFailure(raw_err) => {
+                            log::info!("Error: {raw_err}");
+                            let err = strip_ansi_escapes::strip_str(&raw_err);
+                            send_md(&bot, msg.chat.id, &wrap_in_md(&err)).await?;
+                        }
+                    }
+                }
+                Err(error) => {
+                    send_message(&bot, msg.chat.id, &error).await?;
+                }
+            }
         }
     };
 
