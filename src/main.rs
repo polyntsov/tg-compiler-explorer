@@ -1,6 +1,10 @@
+use std::borrow::Cow;
 use teloxide::{
-    prelude::*, types::MessageEntityKind, types::ParseMode, utils::command::BotCommands,
-    utils::markdown,
+    payloads::SendMessage,
+    prelude::*,
+    requests::JsonRequest,
+    types::{MessageEntityKind, ParseMode},
+    utils::{command::BotCommands, markdown},
 };
 
 mod godbolt;
@@ -29,6 +33,8 @@ enum Command {
     Compile,
     #[command(description = "list all supported languages.", aliases = ["ls"])]
     Languages,
+    #[command(description = "list all supported compilers, specific language id can be specified.")]
+    Compilers { language: String },
 }
 
 fn format_languages(langs: &[godbolt::Language]) -> String {
@@ -79,11 +85,116 @@ fn wrap_in_md(s: &str) -> String {
     format!("```\n{safe_s}\n```")
 }
 
+fn trim_message(s: &str) -> Cow<str> {
+    const TELEGRAM_MAX_MSG_LEN: usize = 4096;
+    const TRUNCATION_SUFFIX_PLAIN: &str = "\n... (message trimmed)";
+    const TRUNCATION_SUFFIX_MD: &str = "\n... (message trimmed)```";
+    if s.chars().count() <= TELEGRAM_MAX_MSG_LEN {
+        return Cow::Borrowed(s);
+    }
+
+    let suffix = if s.starts_with("```") && s.ends_with("```") {
+        TRUNCATION_SUFFIX_MD
+    } else {
+        TRUNCATION_SUFFIX_PLAIN
+    };
+
+    let suffix_len = suffix.chars().count();
+    let max_len = TELEGRAM_MAX_MSG_LEN - suffix_len;
+
+    let end_index = s
+        .char_indices()
+        .nth(max_len)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+
+    let truncated_s = &s[..end_index];
+
+    Cow::Owned(format!("{}{}", truncated_s, suffix))
+}
+
+fn send_message(bot: &Bot, chat_id: ChatId, s: &str) -> JsonRequest<SendMessage> {
+    bot.send_message(chat_id, trim_message(s))
+}
+
 async fn send_md(bot: &Bot, chat_id: ChatId, s: &str) -> ResponseResult<()> {
-    bot.send_message(chat_id, s)
+    send_message(bot, chat_id, s)
         .parse_mode(ParseMode::MarkdownV2)
         .await?;
     Ok(())
+}
+
+fn format_compilers(compilers: &[&godbolt::Compiler]) -> String {
+    if compilers.is_empty() {
+        return "No compilers found for this language.".to_string();
+    }
+
+    let mut max_id_width = "ID".len();
+    let mut max_name_width = "Name".len();
+    let mut max_version_width = "Version".len();
+
+    for compiler in compilers {
+        max_id_width = max_id_width.max(compiler.id.len());
+        max_name_width = max_name_width.max(compiler.name.len());
+        max_version_width = max_version_width.max(compiler.semver.len());
+    }
+
+    let header = format!(
+        "{:<id_w$} | {:<name_w$} | {:<ver_w$}",
+        "ID",
+        "Name",
+        "Version",
+        id_w = max_id_width,
+        name_w = max_name_width,
+        ver_w = max_version_width
+    );
+
+    let separator = format!(
+        "{:-<id_w$} | {:-<name_w$} | {:-<ver_w$}",
+        "",
+        "",
+        "",
+        id_w = max_id_width,
+        name_w = max_name_width,
+        ver_w = max_version_width
+    );
+
+    let rows: Vec<String> = compilers
+        .iter()
+        .map(|compiler| {
+            format!(
+                "{:<id_w$} | {:<name_w$} | {:<ver_w$}",
+                compiler.id,
+                compiler.name,
+                compiler.semver,
+                id_w = max_id_width,
+                name_w = max_name_width,
+                ver_w = max_version_width
+            )
+        })
+        .collect();
+
+    let mut output_lines = Vec::with_capacity(2 + rows.len());
+    output_lines.push(header);
+    output_lines.push(separator);
+    output_lines.extend(rows);
+
+    wrap_in_md(&output_lines.join("\n"))
+}
+
+fn parse_compilers_language(s: &str) -> (&str, &str) {
+    let s = s.trim();
+
+    match s.split_once(char::is_whitespace) {
+        Some((first, remainder)) => (first, remainder),
+        None => {
+            if s.is_empty() {
+                ("", "")
+            } else {
+                (s, "")
+            }
+        }
+    }
 }
 
 fn parse_compile_msg(msg: &Message) -> Result<(String, String), String> {
@@ -143,23 +254,29 @@ async fn answer(bot: Bot, msg: Message, cmd: Command) -> ResponseResult<()> {
                     match res {
                         godbolt::CompilationOutput::Assembly(assembly) => {
                             log::info!("Assembly: {assembly}");
-                            bot.send_message(msg.chat.id, wrap_in_md(&assembly))
-                                .parse_mode(ParseMode::MarkdownV2)
-                                .await?;
+                            send_md(&bot, msg.chat.id, &wrap_in_md(&assembly)).await?;
                         }
                         godbolt::CompilationOutput::Stderr(raw_err) => {
                             log::info!("Error: {raw_err}");
                             let err = strip_ansi_escapes::strip_str(&raw_err);
-                            bot.send_message(msg.chat.id, wrap_in_md(&err))
-                                .parse_mode(ParseMode::MarkdownV2)
-                                .await?;
+                            send_md(&bot, msg.chat.id, &wrap_in_md(&err)).await?;
                         }
                     }
                 }
                 Err(error) => {
-                    bot.send_message(msg.chat.id, error).await?;
+                    send_message(&bot, msg.chat.id, &error).await?;
                 }
             }
+        }
+        Command::Compilers { language } => {
+            let (language_id, filter) = parse_compilers_language(&language);
+            let compilers = godbolt::compilers_for_language(language_id).await?;
+            let filtered_compilers = compilers
+                .iter()
+                .filter(|compiler| compiler.name.contains(filter))
+                .collect::<Vec<&godbolt::Compiler>>();
+            let message = format_compilers(&filtered_compilers);
+            send_md(&bot, msg.chat.id, &message).await?;
         }
     };
 

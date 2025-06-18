@@ -40,6 +40,13 @@ pub enum CompilationOutput {
     Stderr(String),
 }
 
+#[derive(Debug, Deserialize)]
+pub struct Compiler {
+    pub id: String,
+    pub name: String,
+    pub semver: String,
+}
+
 const GODBOLT_URL: &str = "https://godbolt.org";
 
 fn route(path: &str) -> String {
@@ -72,6 +79,7 @@ pub async fn compile(compiler_id: &str, code: &str) -> Result<CompilationOutput,
     let res = client
         .post(request_url)
         .header("Accept", "application/json")
+        .query(&[("fields", "id,name,semver")])
         .json(&request_body)
         .send()
         .await?;
@@ -95,6 +103,36 @@ pub async fn compile(compiler_id: &str, code: &str) -> Result<CompilationOutput,
             .join("\n");
         Ok(CompilationOutput::Assembly(assembly_output))
     }
+}
+
+/// # Description
+/// Retrieves a list of all supported compilers for a specific language.
+///
+/// # Arguments
+/// * `language_id` - The ID of the language (e.g., "rust", "cpp", "csharp").
+///
+/// # Returns
+/// A `Result` which is:
+/// * `Ok(Vec<Compiler>)` on a successful API call, containing the list of compilers.
+/// * `Err(reqwest::Error)` if a network or deserialization error occurs.
+pub async fn compilers_for_language(language_id: &str) -> Result<Vec<Compiler>, Error> {
+    let request_url = route(&format!("compilers/{}", language_id));
+    log::info!(
+        "Requesting compilers for language '{}' from URL: {}",
+        language_id,
+        request_url
+    );
+
+    let client = reqwest::Client::new();
+    let res = client
+        .get(request_url)
+        .header("Accept", "application/json")
+        .send()
+        .await?;
+
+    let compilers: Vec<Compiler> = res.json().await?;
+
+    Ok(compilers)
 }
 
 pub async fn languages() -> Result<Vec<Language>, Error> {
